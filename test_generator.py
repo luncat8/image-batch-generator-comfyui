@@ -15,6 +15,7 @@ sys.dont_write_bytecode = True
 
 import comfy_queue as core
 import launch
+from tools.audio_audition import build as build_audition
 
 HERE = Path(__file__).resolve().parent
 GRAVITY_MD = HERE / 'projects' / 'gravity' / 'prompts.md'
@@ -22,6 +23,8 @@ JOKE_MD = HERE / 'projects' / 'gravity' / 'helper-joke-prompts.md'
 ARC_MD = HERE / 'projects' / 'arc-steam' / 'prompts.md'
 ARC_PROJECT = HERE / 'projects' / 'arc-steam.json'
 GRAVITY_PROJECT = HERE / 'projects' / 'gravity.json'
+STABLE_WF = HERE / 'workflows' / 'audio_stable_audio_3_medium_api.json'
+AUDIO_WF = HERE / 'workflows' / 'audio_yue2_text2music_api.json'
 VIDEO_WF = HERE / 'workflows' / 'video_minimax_pika_h3_flex_t2v_api.json'
 
 
@@ -59,6 +62,8 @@ class GeneratorTests(unittest.TestCase):
 		for name, path in core.WORKFLOWS.items():
 			with self.subTest(workflow=name):
 				template = json.loads(Path(path).read_text())
+				if core.workflow_media(template) == 'audio':
+					continue  # exercised by the music binding test
 				before = json.dumps(template)
 				graph = core.patch_graph(template, dict(text='A silver launch rail.',
 					seed=123, target='photos/career/test.jpg', situation='career'), settings())
@@ -196,7 +201,104 @@ class GeneratorTests(unittest.TestCase):
 				core.main(['--project', str(root / 'project.json'), '--list'])
 			self.assertIn('hello.jpg', output.getvalue())
 
-	def test_queue_collect_image_and_video(self):
+	def test_workflow_blocks_choose_text_and_preserve_item_identity(self):
+		with tempfile.TemporaryDirectory() as directory:
+			root = Path(directory)
+			pack = root / 'original.md'
+			moss, krea = 'image_moss_image_t2i', 'image_krea2_turbo_t2i_int8'
+			pack.write_text('### 1 · art · Moon → `art/moon.jpg`\n*ID: moon-card*\n'
+				f'> Fallback caption\n*For: {moss}*\n> {{\n>   "scene": "A moon"\n> }}\n'
+				f'*For: {krea}*\n> moon, craters\n', encoding='utf-8')
+			items = core.read_prompts(pack)
+			self.assertEqual(core.texts_for(items[0], 'not-listed'), ['Fallback caption'])
+			jobs = core.make_jobs(items, settings(out=directory), [moss, krea], auto_default='not-listed')
+			self.assertEqual([j['text'] for j in jobs], ['{\n  "scene": "A moon"\n}', 'moon, craters'])
+			self.assertNotEqual(jobs[0]['target'], jobs[1]['target'])
+			card, = launch.parse_prompts(pack)
+			self.assertTrue(launch.enabled_for(card, Path(moss + '.json'), {}))
+			self.assertFalse(launch.enabled_for(card, Path(moss + '.json'), {'workflows': {moss + '.json': False}}))
+			self.assertFalse(launch.enabled_for(card, Path('not-listed.json'), {}))
+			self.assertEqual(launch.caption_for(card, krea), 'moon, craters')
+			moved = pack.rename(root / 'moved.md')
+			new, = launch.parse_prompts(moved)
+			self.assertEqual(launch.job_state_key(pack, card), launch.job_state_key(moved, new))
+			self.assertEqual(card['slug'], new['slug'])
+			moved.write_text(f'### 1 · art · Moon → `art/moon.jpg`\n*For: {moss}*\n> Only Moss\n', encoding='utf-8')
+			self.assertEqual(core.texts_for(core.read_prompts(moved)[0], krea), [])
+
+	def test_attach_files_updates_project_and_rejects_duplicate_item_id(self):
+		with tempfile.TemporaryDirectory() as directory:
+			root = Path(directory)
+			project = root / 'project.json'
+			project.write_text(json.dumps(dict(name='test', prompts=[], workflows='workflows', output='out')))
+			pack, duplicate = root / 'one.md', root / 'two.md'
+			for path in (pack, duplicate):
+				path.write_text('### 1 · art · Moon → `art/moon.jpg`\n*ID: moon-card*\n> A moon\n', encoding='utf-8')
+			previous = launch.PROJECT_PATH
+			try:
+				launch.use_project(project)
+				self.assertEqual(launch.attach_prompt_files([pack]), 1)
+				self.assertEqual(launch.attach_prompt_files([pack]), 0)
+				with self.assertRaisesRegex(SystemExit, 'duplicate prompt item ID'):
+					launch.attach_prompt_files([duplicate])
+				self.assertEqual(json.loads(project.read_text())['prompts'], ['one.md'])
+			finally:
+				launch.use_project(previous)
+
+	def test_music_bindings_and_model_isolation(self):
+		with tempfile.TemporaryDirectory() as directory:
+			pack = Path(directory) / 'samples.json'
+			lyrics = '[Verse]\nTest one\n\n[Chorus]\nTest two'
+			pack.write_text(json.dumps({'samples': [dict(genre_id='blues', sample_id='fixture',
+				style='Test style', lyrics=lyrics)]}))
+			items = core.read_prompts(pack)
+			base = settings(out=directory, variants=2)
+			changed = settings(out=directory, variants=2, set=['33:15.ckpt_name="other/model.safetensors"'])
+			jobs = core.make_jobs(items, base, list(core.WORKFLOWS))
+			other = core.make_jobs(items, changed, [AUDIO_WF.stem])
+			self.assertEqual([job['seed'] for job in jobs], [42, 43])
+			self.assertEqual([job['seed'] for job in other], [42, 43])
+			self.assertTrue(all(a['target'] != b['target'] for a, b in zip(jobs, other)))
+			template = json.loads(AUDIO_WF.read_text())
+			before = json.dumps(template)
+			graph = core.patch_graph(template, jobs[0], base)
+			self.assertEqual(json.dumps(template), before)
+			self.assertEqual(graph['33:36']['inputs']['value'], 'Test style')
+			self.assertEqual(graph['33:37']['inputs']['value'], lyrics)
+			self.assertEqual(graph['33:34']['inputs']['seed'], 42)
+			for nid in ('33:8', '33:24', '33:25'):
+				self.assertEqual(graph[nid]['inputs']['seed'], ['33:34', 0])
+			self.assertEqual(core.music.provenance(graph, jobs[0])['checkpoint'],
+				'yue2_3b_int8_convrot.safetensors')
+			pack.write_text(json.dumps({'samples': [dict(genre_id='../bad', sample_id='x', style='x')]}))
+			with self.assertRaisesRegex(SystemExit, 'lowercase slugs'):
+				core.read_prompts(pack)
+
+	def test_gravity_cue_settings_and_seed_match_filtered_runs(self):
+		with tempfile.TemporaryDirectory() as directory:
+			pack = Path(directory) / 'cues.json'
+			pack.write_text(json.dumps(dict(aim=[dict(id='loop', text='Loop', seconds=7, steps=8)],
+				armed=[], launch=[dict(id='impact', text='Impact', seconds=4.5, steps=10)], fly=[])))
+			items = core.read_prompts(pack)
+			args = settings(out=directory, variants=2, seed=None)
+			jobs = core.make_jobs(items, args, list(core.WORKFLOWS))
+			self.assertEqual([job['workflow'] for job in jobs], [STABLE_WF.stem] * 4)
+			self.assertEqual([job['seed'] for job in jobs], [4100, 4101, 4200, 4201])
+			selected = core.select(items, 'launch', 'both')
+			self.assertEqual(core.make_jobs(selected, args, [STABLE_WF.stem]), jobs[2:])
+			job = jobs[2]
+			graph = core.build(STABLE_WF, job, args)
+			self.assertEqual(graph['6']['inputs']['text'], 'Impact')
+			self.assertEqual(graph['7']['inputs']['text'], '')
+			self.assertEqual(graph['11']['inputs']['seconds'], 4.5)
+			self.assertEqual(graph['3']['inputs']['steps'], 10)
+			self.assertEqual(graph['3']['inputs']['seed'], 4200)
+			changed = settings(out=directory, steps=9, seed=None)
+			new, = core.make_jobs(selected, changed, [STABLE_WF.stem])
+			self.assertNotEqual(job['target'], new['target'])
+			self.assertEqual(core.music.provenance(graph, job)['cue'], 'launch')
+
+	def test_queue_collect_image_video_and_audio(self):
 		requests = []
 		class Handler(BaseHTTPRequestHandler):
 			def log_message(self, *args):
@@ -217,9 +319,10 @@ class GeneratorTests(unittest.TestCase):
 					return
 				pid = self.path.rsplit('/', 1)[-1]
 				graph = requests[int(pid) - 1]['prompt']
-				video = bool(core.nodes_of(graph, 'SaveVideo'))
+				key, filename = {'audio': ('audio', 'render.flac'), 'video': ('videos', 'render.mp4'),
+					'image': ('images', 'render.png')}[core.workflow_media(graph)]
 				entry = {'status': {'status_str': 'success'}, 'outputs': {'save': {
-					'videos' if video else 'images': [{'filename': 'render.mp4' if video else 'render.png'}]}}}
+					key: [{'filename': filename, 'type': 'output'}]}}}
 				self.wfile.write(json.dumps({pid: entry}).encode())
 
 		server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
@@ -236,6 +339,41 @@ class GeneratorTests(unittest.TestCase):
 					self.assertEqual(result, 0)
 					self.assertEqual(len(list((root / situation).iterdir())), count)
 				self.assertTrue(all('extra_pnginfo' in r['extra_data'] for r in requests))
+				pack = root / 'samples.json'
+				pack.write_text(json.dumps({'samples': [dict(genre_id='blues',
+					sample_id='fixture', style='Test style', lyrics='[Verse]\nTest line')]}))
+				options = ['--project', str(HERE / 'projects/music-tree.json'), '--out', str(root / 'music'),
+					'--server', f'http://127.0.0.1:{server.server_port}']
+				with contextlib.redirect_stdout(io.StringIO()):
+					self.assertEqual(core.main(options + ['--prompts', str(pack), '--seed', '42']), 0)
+					self.assertEqual(core.main(options + ['--collect']), 0)
+					count = len(requests)
+					self.assertEqual(core.main(options + ['--prompts', str(pack)]), 0)
+					self.assertEqual(len(requests), count)
+				audio, = (root / 'music').rglob('*.flac')
+				self.assertEqual(audio.read_bytes(), b'fixture-media')
+				metadata = json.loads(audio.with_suffix('.flac.json').read_text())
+				self.assertEqual(metadata['genre_id'], 'blues')
+				self.assertEqual(metadata['workflow'], AUDIO_WF.stem)
+				self.assertEqual(metadata['checkpoint'], 'yue2_3b_int8_convrot.safetensors')
+				self.assertEqual(metadata['seed'], 42)
+
+				cues = root / 'cues.json'
+				cues.write_text(json.dumps(dict(aim=[], armed=[], fly=[], launch=[dict(
+					id='fixture', text='Impact <test>', seconds=4.5, steps=10)])))
+				out = root / 'gravity sounds'
+				with contextlib.redirect_stdout(io.StringIO()):
+					self.assertEqual(core.main(['--project', str(HERE / 'projects/gravity-sounds.json'),
+						'--out', str(out), '--server', f'http://127.0.0.1:{server.server_port}',
+						'--prompts', str(cues), '--wait']), 0)
+				page, count = build_audition(out)
+				self.assertEqual(count, 1)
+				audition = page.read_text()
+				self.assertIn('Impact &lt;test&gt;', audition)
+				self.assertIn('steps: 10', audition)
+				take, = out.rglob('take-1.flac')
+				self.assertIn(take.relative_to(out).as_posix(), audition)
+
 		finally:
 			server.shutdown()
 			server.server_close()

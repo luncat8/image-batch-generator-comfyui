@@ -22,6 +22,7 @@ import math
 import os
 import queue
 import random
+import shutil
 import subprocess
 import sys
 import threading
@@ -52,6 +53,7 @@ CARD_PADX = 12     # card inner horizontal padding
 SCROLL_STEP = 20   # one wheel unit, px - not Tk's 1/10 of the viewport
 WHEEL_UNITS = 3    # wheel units per notch
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".webm"}
+AUDIO_EXTS = launch.core.music.AUDIO_EXTS
 VIDEO_EXTS = (".mp4", ".webm")
 # a file younger than this may still be filling: the scan skips it
 SETTLE_S = 2.0
@@ -219,15 +221,17 @@ class PromptCard(tk.Frame):
 		self.count_lbl.pack(side="right")
 
 		# ---- caption
-		self.caption_lbl = tk.Label(self, text=job["caption"], justify="left", bg=bg,
+		self.caption_lbl = tk.Label(self, text=("\n\n".join((["Fallback: " + job["caption"]] if job.get("fallback_texts") else []) +
+			[f"{name}: {text}" for name, text in job["workflow_prompts"].items()])
+			if job.get("workflow_prompts") else job["caption"]), justify="left", bg=bg,
 									fg=FG if self.enabled else DIM, font=F(9))
 		self.caption_lbl.pack(fill="x", pady=(4, 2))
 		self.set_wrap()
 
 		# ---- meta line
 		self.meta_lbl = tk.Label(
-			self, text=(f"{job['aspect_ratio']}  ·  {job['megapixels']} MP"
-						f"  ·  target {job['filename']}"),
+			self, text=(f"Audio · {job['adapter']} · {job['sample_id']}" if job.get("media") == "audio"
+				else f"{job['aspect_ratio']}  ·  {job['megapixels']} MP  ·  target {job['filename']}"),
 			bg=bg, fg=FAINT, font=F(8))
 		self.meta_lbl.pack(anchor="w")
 
@@ -235,7 +239,7 @@ class PromptCard(tk.Frame):
 		self.thumb_box = tk.Frame(self, bg=bg)
 		self.thumb_box.pack(fill="x", pady=(6, 4))
 		self.empty_lbl = tk.Label(self.thumb_box, bg=bg, fg=FAINT, font=F(9),
-			text="no images yet - queue one below, or Run batch")
+			text="no renders yet - queue one below, or Run batch")
 
 		# ---- footer buttons
 		foot = tk.Frame(self, bg=bg)
@@ -342,6 +346,13 @@ class PromptCard(tk.Frame):
 	def _add_thumb(self, path):
 		app, bg = self.app, self.bg
 		cell = tk.Frame(self.thumb_box, bg=bg)
+		if path.suffix.lower() in AUDIO_EXTS:
+			lbl = app.mkbtn(cell, "▶ Preview audio", lambda: app.open_viewer(self.key, path))
+			lbl.grid(sticky="w")
+			tk.Label(cell, text=app.audio_label(path), bg=bg, fg=DIM, wraplength=THUMB_W,
+				font=app.F(8)).grid(sticky="w")
+			Tooltip(lbl, str(path))
+			return cell, lbl
 		photo = app.thumb_photo(path)
 		if photo is None:
 			lbl = tk.Label(cell, text="?  (preview not supported)", bg=EDGE,
@@ -873,14 +884,17 @@ class App(tk.Tk):
 	def _load_project_files(self):
 		"""Read what the project names: its prompt markdown, its workflows and
 		the job table they produce - the list the cards and the sidebar show."""
-		self.md_paths = launch.find_prompt_mds()
+		paths = launch.find_prompt_mds()
+		parsed = {path: launch.parse_prompts(path) for path in paths}
+		launch.core.validate_item_ids(job for jobs in parsed.values() for job in jobs)
+		self.md_paths = paths
 		self.wf_paths = launch.find_workflows()
 		self.wf_stems = {p.stem for p in self.wf_paths}
 		self.wf_templates = {}
 		self.jobs, self.job_order, self.job_md = {}, [], {}
 		self.md_jobs = {p.name: [] for p in self.md_paths}
 		for md in self.md_paths:
-			for job in launch.parse_prompts(md):
+			for job in parsed[md]:
 				key = launch.job_state_key(md, job)
 				if key in self.jobs:  # duplicate slug in one file
 					continue
@@ -890,6 +904,10 @@ class App(tk.Tk):
 				self.md_jobs[md.name].append(key)
 		self.stem_owner = {self.jobs[key]["slug"].replace(" ", "_"): key
 						   for key in self.job_order}
+
+		self.audio_owner = {(job["adapter"], job["type"], job["sample_id"]): key
+			for key, job in self.jobs.items() if job.get("media") == "audio"}
+		self.item_owner = {job["item_id"]: key for key, job in self.jobs.items() if job.get("item_id")}
 
 	# ================================================================ UI
 	def mkbtn(self, parent, text, cmd, primary=False, width=None):
@@ -908,7 +926,7 @@ class App(tk.Tk):
 	def _build_toolbar(self):
 		bar = tk.Frame(self, bg=PANEL, padx=10, pady=8)
 		bar.pack(fill="x")
-		self.mkbtn(bar, "Refresh", self.refresh).pack(side="left")
+		self.mkbtn(bar, "Refresh", self.reload_prompt_files).pack(side="left")
 		tk.Label(bar, text="  filter", bg=PANEL, fg=DIM,
 				 font=self.F(9)).pack(side="left")
 		self.filter_var = tk.StringVar()
@@ -1015,6 +1033,9 @@ class App(tk.Tk):
 	def _build_workflow_box(self, parent):
 		F9 = self.F(9)
 		box = self._side_box(parent, "Workflows")
+		button = self.mkbtn(box, "Reset to prompt defaults", self.reset_workflows)
+		button.pack(anchor="w")
+		Tooltip(button, "Use each prompt’s preferred workflows; untargeted prompts use the project default.")
 		if not self.wf_paths:
 			tk.Label(box, text="none found - drop a ComfyUI API-format "
 					 "*.json next to gallery.py", bg=PANEL, fg=FAINT,
@@ -1033,6 +1054,7 @@ class App(tk.Tk):
 	def _build_prompt_box(self, parent):
 		F9 = self.F(9)
 		box = self._side_box(parent, "Prompt files")
+		self.mkbtn(box, "Add prompt files…", self.add_prompt_files).pack(anchor="w", pady=(0, 5))
 		if not self.md_paths:
 			tk.Label(box, text="none found - drop a prompts *.md with "
 					 "### N · category · slug -> `file` headings",
@@ -1204,8 +1226,19 @@ class App(tk.Tk):
 		return (self.st.get("prompts") or {}).get(name, True)
 
 	def wf_enabled(self, name):
-		return (self.st.get("workflows") or {}).get(
-			name, Path(name).stem == launch.CONFIG.get("default_workflow"))
+		entry = (self.st.get("workflows") or {}).get(name)
+		if entry is not None:
+			return entry
+		stem = Path(name).stem
+		return (stem == launch.CONFIG.get("default_workflow") or
+			any(stem in launch.preferred_for(job) for job in self.jobs.values()))
+
+	def reset_workflows(self):
+		self.st.pop("workflows", None)
+		self.save_state_now()
+		self._build_side_lists()
+		self.update_sidebar_stats()
+		self.status("using each prompt’s workflow defaults")
 
 	def job_enabled(self, key):
 		return (self.st.get("jobs") or {}).get(key, True)
@@ -1266,8 +1299,12 @@ class App(tk.Tk):
 		if not self.out_dir.exists():
 			return out
 		now = time.time()
-		for p in self.out_dir.iterdir():
-			if not p.is_file() or p.suffix.lower() not in IMAGE_EXTS:
+		paths = self.out_dir.rglob("*") if self.audio_owner or self.item_owner else self.out_dir.iterdir()
+		for p in paths:
+			rel = p.relative_to(self.out_dir)
+			ext = p.suffix.lower()
+			visual = ext in IMAGE_EXTS and (len(rel.parts) == 1 or rel.parts[0] == "items")
+			if ".trash" in rel.parts or not (visual or ext in AUDIO_EXTS) or not p.is_file():
 				continue
 			try:
 				st = p.stat()
@@ -1275,7 +1312,7 @@ class App(tk.Tk):
 				continue
 			if st.st_size == 0 or now - st.st_mtime < SETTLE_S:
 				continue
-			out[p.name] = (st.st_mtime, st.st_size)
+			out[rel.as_posix()] = (st.st_mtime, st.st_size)
 		return out
 
 	def index_scan(self, scan):
@@ -1284,7 +1321,16 @@ class App(tk.Tk):
 		order and the list never jumps between two worker ticks)."""
 		by_key, orphans = {}, 0
 		for name, (mtime, _size) in scan.items():
-			key = self.stem_owner.get(split_name(name, self.wf_stems))
+			rel = Path(name)
+			key = self.stem_owner.get(split_name(name, self.wf_stems)) if len(rel.parts) == 1 else None
+			if len(rel.parts) == 4 and rel.parts[0] == "items":
+				key = self.item_owner.get(rel.parts[1])
+			if key is None and Path(name).suffix.lower() in AUDIO_EXTS:
+				meta = self.audio_metadata(self.out_dir / name)
+				kind, group = ("yue2", meta.get("genre_id")) if "genre_id" in meta else ("stable-audio", meta.get("cue"))
+				sample = meta.get("sample_id")
+				if isinstance(group, str) and isinstance(sample, str):
+					key = self.audio_owner.get((kind, group, sample))
 			if key is None:
 				orphans += 1
 				continue
@@ -1294,6 +1340,19 @@ class App(tk.Tk):
 			by_key[key] = [self.out_dir / name for _mtime, name in rows]
 		self.files_by_key = by_key
 		self.orphans = orphans
+
+	@staticmethod
+	def audio_metadata(path):
+		try:
+			data = json.loads(path.with_suffix(path.suffix + ".json").read_text(encoding="utf-8"))
+		except (OSError, ValueError):
+			return {}
+		return data if isinstance(data, dict) else {}
+
+	def audio_label(self, path):
+		meta = self.audio_metadata(path)
+		model = meta.get("checkpoint") or meta.get("workflow")
+		return f"{model} · seed {meta.get('seed', '—')}" if model else path.name
 
 	def images_for(self, key):
 		return self.files_by_key.get(key, [])
@@ -1382,7 +1441,7 @@ class App(tk.Tk):
 		except Exception as e:
 			self.status(f"delete failed: {e}")
 			return
-		self.trash_stack.append(dest)
+		self.trash_stack.append((dest, path))
 		if not quiet:
 			self.status(f"moved to .trash: {path.name}  (Ctrl+Z to undo)")
 		self.rescan_now()
@@ -1391,14 +1450,14 @@ class App(tk.Tk):
 		if not self.trash_stack:
 			self.status("nothing to undo")
 			return
-		src = self.trash_stack.pop()
+		src, dest = self.trash_stack.pop()
 		if not src.exists():
 			self.status("trashed file is gone")
 			return
-		dest = self.out_dir / src.name
 		if dest.exists():
 			self.status(f"cannot undo: {src.name} already exists - left in .trash")
 			return
+		dest.parent.mkdir(parents=True, exist_ok=True)
 		src.rename(dest)
 		self.status(f"restored {src.name}")
 		self.rescan_now()
@@ -1409,9 +1468,6 @@ class App(tk.Tk):
 		self.sync_cards()
 
 	# ================================================================ queue
-	def enabled_workflows(self):
-		return [p for p in self.wf_paths if self.wf_enabled(p.name)]
-
 	def template(self, wf_path):
 		if wf_path not in self.wf_templates:
 			self.wf_templates[wf_path] = json.loads(
@@ -1441,12 +1497,12 @@ class App(tk.Tk):
 		if not self.md_enabled(md) or not self.job_enabled(key):
 			self.status(f"'{job['slug']}' is disabled - enable it first")
 			return 0
-		wfs = self.enabled_workflows()
+		wfs = [p for p in self.wf_paths if launch.enabled_for(job, p, self.st)]
 		if not wfs:
 			if not quiet:
 				messagebox.showwarning(
 					"no workflow", "No workflow is enabled.\n"
-					"Tick at least one *.json under 'Workflows'.")
+					"Check this item’s workflow names or enable a workflow with a fallback prompt.")
 			return 0
 		if count is None:
 			try:
@@ -1459,13 +1515,14 @@ class App(tk.Tk):
 		for wfp in wfs:
 			try:
 				template = self.template(wfp)
-				if not launch.compatible(template, job):
+				if launch.caption_for(job, wfp.stem) is None or not launch.compatible(template, job):
 					continue
 				for _ in range(count):
 					s = seed if seed is not None else random.randint(1, 2**63 - 1)
-					wf = launch.patch_workflow(template, job, s, args)
+					wf = launch.patch_workflow(template, job, s, args, wfp.stem)
+					meta = launch.core.music.provenance(wf, dict(job, variant=0)) if job.get("media") == "audio" else None
 					pid = launch.queue_job(server, wf, job["slug"])
-					self.pending[pid] = (key, s, wfp.stem)
+					self.pending[pid] = (key, s, wfp.stem, meta)
 					self.pending_fails.pop(pid, None)
 					queued += 1
 			except SystemExit as e:
@@ -1479,6 +1536,8 @@ class App(tk.Tk):
 			self.update_pending_label()
 		elif first_err and not quiet:
 			messagebox.showerror("queue failed", first_err)
+		elif not first_err and not quiet:
+			messagebox.showwarning("No matching workflow", "No enabled workflow accepts this item’s prompt and media type.", parent=self)
 		elif first_err:
 			self.status(f"queue failed - {' '.join(first_err.split())[:160]}")
 		return queued
@@ -1634,16 +1693,87 @@ class App(tk.Tk):
 			return
 		self.switch_project(path)
 
-	def open_viewer(self, key, path):
-		if Path(path).suffix.lower() in VIDEO_EXTS:
+	def add_prompt_files(self):
+		paths = filedialog.askopenfilenames(title="Add prompt files", initialdir=str(self.project_path.parent),
+			filetypes=[("Prompt packs", ("*.md", "*.json")), ("All files", "*")])
+		if not paths:
+			return
+		try:
+			added = launch.attach_prompt_files(paths)
+		except (SystemExit, OSError, ValueError) as error:
+			messagebox.showerror("Could not add prompt files", str(error), parent=self)
+			return
+		self.reload_prompt_files()
+		self.status(f"added {added} prompt file(s) to {launch.CONFIG['name']}")
+
+	def reload_prompt_files(self):
+		try:
+			self._load_project_files()
+		except (SystemExit, OSError, ValueError) as error:
+			messagebox.showerror("Could not load prompts", str(error), parent=self)
+			return
+		self._close_viewer()
+		self._build_side_lists()
+		self.refresh()
+
+	def open_media_file(self, path):
+		try:
 			if sys.platform == "win32":
 				os.startfile(str(path))
 			else:
-				subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open",
-								  str(path)])
+				subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(path)])
+		except OSError as error:
+			messagebox.showerror("Cannot open media", str(error), parent=self)
+
+	def preview_audio(self, path):
+		player = shutil.which("ffplay")
+		if not player:
+			self.open_media_file(path)
+			return
+		self._close_viewer()
+		win = self._viewer = tk.Toplevel(self)
+		win.title("Audio preview")
+		win.transient(self)
+		tk.Label(win, text=self.audio_label(path), padx=16, pady=8).pack()
+		tk.Label(win, text=path.name, padx=16).pack()
+		process = None
+
+		def stop():
+			if process is not None and process.poll() is None:
+				try:
+					process.terminate()
+				except ProcessLookupError:
+					pass
+
+		def play():
+			nonlocal process
+			stop()
+			try:
+				process = subprocess.Popen([player, "-nodisp", "-autoexit", "-loglevel", "error", str(path)],
+					stdin=subprocess.DEVNULL)
+			except OSError:
+				self.open_media_file(path)
+
+		win.bind("<Destroy>", lambda event: stop() if event.widget is win else None)
+		bar = tk.Frame(win, pady=8)
+		bar.pack()
+		for label, action in (("Play", play), ("Stop", stop), ("Open in player", lambda: self.open_media_file(path))):
+			self.mkbtn(bar, label, action).pack(side="left", padx=4)
+		play()
+
+	def open_viewer(self, key, path):
+		if Path(path).suffix.lower() in AUDIO_EXTS:
+			self.select_key(key)
+			self.preview_audio(Path(path))
+			return
+		if Path(path).suffix.lower() in VIDEO_EXTS:
+			self.open_media_file(path)
 			return
 		self.select_key(key)
 		viewer = getattr(self, "_viewer", None)
+		if viewer is not None and viewer.winfo_exists() and not isinstance(viewer, Viewer):
+			self._close_viewer()
+			viewer = None
 		if viewer is not None and viewer.winfo_exists():
 			viewer.key = key
 			viewer.path = Path(path)
@@ -1685,7 +1815,8 @@ class App(tk.Tk):
 		if not flt:
 			return True
 		job = self.jobs[key]
-		return flt in f"{key} {job['category']} {job['caption']}".lower()
+		return any(flt in part.lower() for part in (key, job["category"], job["caption"],
+			*job.get("workflow_prompts", {}), *job.get("workflow_prompts", {}).values()))
 
 	def rebuild_cards(self):
 		"""The card set changed (filter, prompt file, size, mode): rebuild."""
@@ -1735,7 +1866,7 @@ class App(tk.Tk):
 
 	def pending_counts(self):
 		out = {}
-		for key, _seed, _wf in list(self.pending.values()):
+		for key, *_ in list(self.pending.values()):
 			out[key] = out.get(key, 0) + 1
 		return out
 
@@ -1775,14 +1906,14 @@ class App(tk.Tk):
 				self.grid_cells[path] = cell
 				self._fill_grid_cell(cell, key, path)
 		if not count:
-			tk.Label(body, text="no images yet - queue a prompt card first",
+			tk.Label(body, text="no renders yet - queue a prompt card first",
 					 bg=BG, fg=FAINT, font=self.F(10)).grid(row=0, column=0,
 															padx=14, pady=14)
 
 	def _fill_grid_cell(self, cell, key, path):
 		photo = self.thumb_photo(path)
 		if photo is None:
-			lbl = tk.Label(cell, text="?  (no preview)", bg=EDGE, fg=DIM,
+			lbl = tk.Label(cell, text="▶ Preview audio" if path.suffix.lower() in AUDIO_EXTS else "?  (no preview)", bg=EDGE, fg=DIM,
 						   width=22, height=6, font=self.F(8))
 		else:
 			lbl = tk.Label(cell, image=photo, bg=CARD, cursor="hand2")
@@ -1842,7 +1973,7 @@ class App(tk.Tk):
 		for name, (_var, lbl) in self.md_stats.items():
 			keys = self.md_jobs.get(name, [])
 			images = sum(len(self.images_for(k)) for k in keys)
-			text = (f"{len(keys)} prompts · {images} images · "
+			text = (f"{len(keys)} prompts · {images} renders · "
 					f"{sum(1 for k in keys if self.job_enabled(k))} enabled")
 			if lbl.cget("text") != text:
 				lbl.configure(text=text)
@@ -1855,11 +1986,11 @@ class App(tk.Tk):
 			if lbl.cget("text") != text:
 				lbl.configure(text=text)
 		total = sum(len(v) for v in self.files_by_key.values())
-		note = f"{total} image{'s' if total != 1 else ''} on disk · {len(self.job_order)} prompts"
+		note = f"{total} render{'s' if total != 1 else ''} on disk · {len(self.job_order)} prompts"
 		if self.orphans:
 			note += f"\n{self.orphans} file(s) match no prompt"
 		note += ("\ncheckboxes are saved to state.toml on every change and on exit; "
-				 "launch.py reads them too\nCtrl+Z restores the last deleted image")
+				 "launch.py reads them too\nCtrl+Z restores the last deleted render")
 		if self.side_note.cget("text") != note:
 			self.side_note.configure(text=note)
 
@@ -1888,7 +2019,7 @@ class App(tk.Tk):
 			try:
 				# 1) finish pending downloads
 				for pid in list(self.pending):
-					jkey, seed, workflow = self.pending[pid]
+					jkey, seed, workflow, audio_meta = self.pending[pid]
 					try:
 						entry = launch.get_history(server, pid)
 					except Exception as e:
@@ -1909,12 +2040,14 @@ class App(tk.Tk):
 						continue
 					imgs = []
 					for node_out in (entry.get("outputs") or {}).values():
+						if audio_meta is not None:
+							node_out = {"audio": [item for item in node_out.get("audio", ()) if item.get("type", "output") == "output"]}
 						imgs.extend(launch.core.output_files(node_out))
 					if not imgs:
 						self.ev.put(("job_failed", pid, jkey,
-									 "job finished but saved no image"))
+									 "job finished but saved no media"))
 						continue
-					saved = self._worker_download(server, jkey, seed, imgs, workflow)
+					saved = self._worker_download(server, jkey, seed, imgs, workflow, audio_meta, pid)
 					if saved:
 						self.ev.put(("downloaded", jkey, saved))
 				# 2) rescan the output dir
@@ -1932,9 +2065,12 @@ class App(tk.Tk):
 				pass
 			time.sleep(1.0)
 
-	def _worker_download(self, server, jkey, seed, imgs, workflow):
+	def _worker_download(self, server, jkey, seed, imgs, workflow, audio_meta, pid):
 		out_dir = self.out_dir            # a switch mid-download keeps this one
-		stem = self.jobs[jkey]["slug"].replace(" ", "_")
+		job = self.jobs.get(jkey)
+		if job is None:
+			return []
+		stem = job["slug"].replace(" ", "_")
 		saved = []
 		for i, info in enumerate(imgs):
 			ext = Path(info["filename"]).suffix or ".png"
@@ -1944,6 +2080,9 @@ class App(tk.Tk):
 				continue
 			try:
 				launch.download_image(server, info, out)
+				if audio_meta is not None:
+					out.with_suffix(out.suffix + ".json").write_text(json.dumps(
+						dict(audio_meta, workflow=workflow, prompt_id=pid, file=out.name), ensure_ascii=False, indent=2), encoding="utf-8")
 				saved.append(out.name)
 			except Exception:
 				pass

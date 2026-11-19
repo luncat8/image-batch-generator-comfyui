@@ -4,6 +4,7 @@ import argparse
 import json
 import re
 import random
+import os
 import sys
 import urllib.parse
 import uuid
@@ -228,21 +229,68 @@ def find_prompt_mds():
 	return [BASE / p for p in CONFIG['prompts']]
 
 
+def attach_prompt_files(paths):
+	"""Validate the combined project before writing links to the chosen packs."""
+	current = find_prompt_mds()
+	known = set(p.resolve() for p in current)
+	added = []
+	for path in map(Path, paths):
+		path = path.resolve()
+		if path in known:
+			continue
+		if path.suffix.lower() not in ('.md', '.json'):
+			raise SystemExit(f'not a Markdown or JSON prompt pack: {path}')
+		if any(other.stem.casefold() == path.stem.casefold() for other in current + added):
+			raise SystemExit(f'an attached prompt file already uses the name {path.stem!r}')
+		known.add(path)
+		added.append(path)
+	if not added:
+		return 0
+	core.validate_item_ids([item for path in current + added for item in core.read_prompts(path)])
+	config = dict(CONFIG, prompts=CONFIG['prompts'] + [os.path.relpath(path, BASE)
+		if path.drive == BASE.drive else str(path) for path in added])
+	temporary = PROJECT_PATH.with_suffix('.json.tmp')
+	temporary.write_text(json.dumps(config, ensure_ascii=False, indent='\t') + '\n', encoding='utf-8')
+	temporary.replace(PROJECT_PATH)
+	use_project(PROJECT_PATH)
+	return len(added)
+
+
+def enabled_for(job, workflow, state):
+	preferred = core.preferred_workflows(job)
+	default = workflow.stem in preferred if preferred else workflow.stem == CONFIG.get('default_workflow')
+	return state.get('workflows', {}).get(workflow.name, default)
+
+
+def preferred_for(job):
+	return core.preferred_workflows(job)
+
+
+def caption_for(job, workflow):
+	if workflow in job.get('workflow_prompts', {}):
+		return job['workflow_prompts'][workflow]
+	return job['caption'] if job.get('fallback_texts', job['texts']) else None
+
+
 def parse_prompts(path):
 	jobs = []
 	for index, item in enumerate(core.project_items(core.read_prompts(path), CONFIG)):
 		item.setdefault('aspect_ratio', '3:2')
 		item.setdefault('megapixels', 1.5)
-		for variant, text in enumerate(item['texts']):
+		for variant, text in enumerate(item['texts'][:1] if item.get('item_id') or item.get('workflow_prompts') else item['texts']):
 			target = Path(item['target'])
 			suffix = '' if variant == 0 else f'-{variant + 1}'
 			slug = f'{Path(path).stem}__{target.parent.name}__{target.stem}{suffix}'
+			if item.get('item_id'):
+				slug = f"item__{item['item_id']}"
 			jobs.append(dict(item, index=index + 1, category=item['situation'],
 				slug=slug, filename=target.name, caption=text))
 	return jobs
 
 
 def job_state_key(path, job):
+	if job.get('item_id'):
+		return f"item::{job['item_id']}"
 	return f"{Path(path).stem}::{job['slug']}"
 
 
@@ -261,9 +309,9 @@ def split_name(name, stems):
 	seeded = SEEDED_NAME_RE.match(base)
 	if seeded:
 		return seeded.group("stem")
-	head, sep, rest = base.rpartition("__")
-	if sep and rest in stems:
-		return head
+	for stem in sorted(stems, key=len, reverse=True):
+		if base.endswith('__' + stem):
+			return base[:-(len(stem) + 2)]
 	return base
 
 
@@ -273,15 +321,18 @@ def seed_of(name):
 
 
 def compatible(template, job):
-	return bool(core.nodes_of(template, 'SaveVideo')) == (job['situation'] == 'video')
+	return core.compatible(template, job)
 
 
-def patch_workflow(template, job, seed, args):
+def patch_workflow(template, job, seed, args, workflow=None):
 	settings = SimpleNamespace(steps=args.steps, cfg=args.cfg,
-		negative=args.negative or None, no_refine=True, size=None, aspect=None,
+		negative=None if job.get('media') == 'audio' else args.negative or None, no_refine=True, size=None, aspect=None,
 		megapixels=None, prefix=CONFIG.get('prefix', 'renders'), set=[])
-	graph = core.patch_graph(template, dict(job, text=job['caption'],
-		target=job['filename'], seed=seed), settings)
+	caption = caption_for(job, workflow)
+	if caption is None:
+		raise SystemExit(f'no caption for workflow {workflow}')
+	graph = core.patch_graph(template, dict(job, text=caption,
+		target=job['filename'], seed=seed, workflow=workflow, variant=0), settings)
 	nid, name = slg_slot(graph)
 	if nid is not None:
 		graph[nid]['inputs'][name] = not args.no_slg
@@ -307,11 +358,10 @@ def main():
 	server = app.get('server', DEFAULT_SERVER)
 	core.manifest_path = OUTPUT_DIR / core.MANIFEST_NAME
 	core.WORKFLOWS = core.discover_workflows(BASE / CONFIG['workflows'])
+	parsed = {path: parse_prompts(path) for path in find_prompt_mds()}
+	core.validate_item_ids(job for jobs in parsed.values() for job in jobs)
 	queued = 0
 	for workflow in find_workflows():
-		if not state.get('workflows', {}).get(workflow.name,
-				workflow.stem == CONFIG.get('default_workflow')):
-			continue
 		template = json.loads(workflow.read_text(encoding='utf-8'))
 		nid, name = slg_slot(template)
 		overrides = [] if nid is None else [f"{nid}.{name}={str(app.get('slg', True)).lower()}"]
@@ -322,16 +372,20 @@ def main():
 			set=overrides, force=options.force, dry_run=options.dry_run,
 			dump=None, no_extra_data=False)
 		jobs = []
-		for path in find_prompt_mds():
+		for path, cards in parsed.items():
 			if not state.get('prompts', {}).get(path.name, True):
 				continue
-			for job in parse_prompts(path):
-				if not compatible(template, job) or not state.get('jobs', {}).get(job_state_key(path, job), True):
+			for job in cards:
+				caption = caption_for(job, workflow.stem)
+				if caption is None or not enabled_for(job, workflow, state) or not compatible(template, job) or not state.get('jobs', {}).get(job_state_key(path, job), True):
 					continue
 				# normalize the slug like gallery.py's stem_owner does, so
 				# the batch filename maps back to the job when re-scanned
 				target = OUTPUT_DIR / f"{job['slug'].replace(' ', '_')}__{workflow.stem}"
-				jobs.append(dict(job, text=job['caption'], target=str(target),
+				if job.get('media') == 'audio':
+					args.negative = None
+					target = target.with_name(target.name + Path(job['filename']).suffix)
+				jobs.append(dict(job, text=caption, target=str(target),
 					seed=random.randrange(2**63), variant=0, workflow=workflow.stem))
 		if options.list:
 			core.print_table(jobs)

@@ -131,3 +131,9 @@ The suite is fully offline: a fake ComfyUI server covers prompt parsing,
 template patching, video filtering, size/`--set` overrides, gallery slug and
 filename mapping, state roundtrip, project discovery, and queue/collect for
 image and video.
+
+### Music generation
+
+The batch CLI supports YuE2 style/lyrics packs and collects audio with model provenance. See the [Music Tree plan and commands](projects/music-tree-plan.md) and the centralized [prompt-writing skills](skills/README.md).
+
+For Stable Audio 3 game cues, see [Gravity Trajectory sound compatibility](projects/gravity-sounds.md). Both audio workflows can build an offline audition page with `python tools/audio_audition.py <output-directory>`.

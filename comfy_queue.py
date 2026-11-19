@@ -33,6 +33,8 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True
 
+import music
+
 HERE = Path(__file__).resolve().parent
 # Manifest targets are stored relative to the generator root (HERE) so a
 # moved checkout still resolves; targets outside the root stay absolute.
@@ -113,7 +115,7 @@ ASPECT_3_2 = '3:2 (Photo)'
 # 1.5 MP at 3:2 is exactly 1536 x 1024, the size photos/README.md asks for.
 MEGAPIXELS = 1.5
 PROMPT_SLOT = '##prompt'
-EXTS = ('.jpg', '.png', '.webp', '.mp4', '.webm')
+EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.gif', '.mp4', '.webm') + music.AUDIO_EXTS
 DEFAULT_SERVER = os.environ.get('COMFYUI', 'http://127.0.0.1:8188')
 
 class ComfyError(RuntimeError):
@@ -196,6 +198,8 @@ def read_prompts(path):
 	the next variant, so one row can carry several finished-image prompts; the
 	generator writes each as its own file (`<stem>.jpg`, `<stem>-2.jpg`, ...).
 	"""
+	if Path(path).suffix.lower() == '.json':
+		return music.read_pack(path)
 	items = []
 	pattern = re.compile(r'^###\s+\d+\s*·\s*([^·]+)\s*·\s*(.+?)\s*→\s*`([^`]+)`\s*$')
 	current = None
@@ -208,13 +212,23 @@ def read_prompts(path):
 			game = where in ('space', 'landed', 'career', 'video')
 			current = {'type': category if game else label,
 				'situation': where if game else category,
-				'target': target, 'style': '', 'parts': []}
+				'target': target, 'style': '', 'parts': [], 'blocks': []}
 			items.append(current)
 			continue
 		if current is None:
 			continue
 		if line.startswith('#'):
 			current = None
+		elif line.startswith('*ID:'):
+			value = line[4:].rstrip('*').strip()
+			if 'item_id' in current or not music.SLUG.fullmatch(value):
+				raise SystemExit(f'{path}: expected one lowercase ID for {current["target"]}')
+			current['item_id'] = value
+		elif line.startswith('*For:'):
+			names = [name.strip() for name in line[5:].rstrip('*').split(',')]
+			if not all(re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]*', name) for name in names):
+				raise SystemExit(f'{path}: invalid workflow stems for {current["target"]}')
+			current['blocks'].append((names, []))
 		elif line.startswith('*Style:'):
 			current['style'] = line[7:].strip().rstrip('*').strip().rstrip('.')
 		elif line.startswith('*Aspect:'):
@@ -223,15 +237,61 @@ def read_prompts(path):
 				current['aspect_ratio'] = aspect.group(1)
 				current['megapixels'] = float(aspect.group(2))
 		elif line.startswith('>'):
-			current['parts'].append(line[1:].strip())
+			if current['blocks']:
+				current['blocks'][-1][1].append(raw.lstrip()[1:].removeprefix(' '))
+			else:
+				current['parts'].append(line[1:].strip())
 	for item in items:
 		item['texts'] = paragraphs(item.pop('parts'))
+		blocks = item.pop('blocks')
+		if blocks:
+			preferred = {}
+			for names, lines in blocks:
+				text = '\n'.join(lines).strip()
+				for name in names:
+					if not text or name in preferred:
+						raise SystemExit(f'{path}: empty or repeated For block for {name} on {item["target"]}')
+					preferred[name] = text
+			item['workflow_prompts'] = preferred
+			item['fallback_texts'] = item['texts']
+			if not item['texts']:
+				item['texts'] = [next(iter(preferred.values()))]
 		if not item['texts']:
 			raise SystemExit(f"empty caption for {item['target']}")
 		item['text'] = item['texts'][0]
 	if not items:
 		raise SystemExit(f'no captions found in {path}')
 	return items
+
+
+def validate_item_ids(items):
+	seen = set()
+	audio = set()
+	for item in items:
+		if item.get('media') == 'audio':
+			key = (item['adapter'], item['type'], item['sample_id'])
+			if key in audio:
+				raise SystemExit(f'duplicate audio sample: {key[1]}/{key[2]}')
+			audio.add(key)
+		identity = item.get('item_id')
+		if identity:
+			if identity in seen:
+				raise SystemExit(f'duplicate prompt item ID: {identity}')
+			seen.add(identity)
+
+
+def texts_for(item, workflow):
+	preferred = item.get('workflow_prompts', {})
+	if workflow in preferred:
+		return [preferred[workflow]]
+	return item.get('fallback_texts', item['texts'])
+
+
+def preferred_workflows(item):
+	if item.get('workflow_prompts'):
+		return tuple(item['workflow_prompts'])
+	return {'yue2': ('audio_yue2_text2music_api',),
+		'stable-audio': ('audio_stable_audio_3_medium_api',)}.get(item.get('adapter'), ())
 
 
 def select(items, types, situation):
@@ -324,8 +384,43 @@ def build(workflow_path, job, args):
 	return patch_graph(json.loads(Path(workflow_path).read_text(encoding='utf-8')), job, args)
 
 
+def workflow_media(graph):
+	if music.save_nodes(graph):
+		return 'audio'
+	return 'video' if nodes_of(graph, 'SaveVideo') else 'image'
+
+
+def compatible(graph, item):
+	media = item.get('media', 'video' if item['situation'] == 'video' else 'image')
+	return workflow_media(graph) == media and (media != 'audio' or music.adapter(graph) == item['adapter'])
+
+
+def patch_audio(workflow, job, args):
+	if any(getattr(args, key) is not None for key in ('size', 'negative')):
+		raise SystemExit('audio does not support --size or --negative')
+	if job['adapter'] == 'stable-audio':
+		music.patch_stable(workflow, job, args)
+	else:
+		style, lyrics, seed, _ = music.bindings(workflow)
+		style['value'], lyrics['value'] = job['text'], job['lyrics']
+		if job['seed'] is not None:
+			seed['seed'] = job['seed']
+		for key in ('steps', 'cfg'):
+			if getattr(args, key) is not None:
+				one_node(workflow, 'KSampler')['inputs'][key] = getattr(args, key)
+	for saver in music.save_nodes(workflow):
+		saver['inputs']['filename_prefix'] = (
+			f'{args.prefix}/{job["type"]}/{job["workflow"]}/'
+			f'{job["sample_id"]}/take-{job["variant"] + 1}')
+	for spec in args.set or ():
+		apply_override(workflow, spec)
+	return workflow
+
+
 def patch_graph(template, job, args):
 	workflow = json.loads(json.dumps(template))
+	if workflow_media(workflow) == 'audio':
+		return patch_audio(workflow, job, args)
 	slot = workflow[prompt_slot(workflow)]['inputs']
 	key = next(key for key, value in slot.items() if value == PROMPT_SLOT)
 	slot[key] = job['text']
@@ -342,7 +437,7 @@ def patch_graph(template, job, args):
 	if args.cfg is not None:
 		sampler['cfg'] = args.cfg
 
-	if args.no_refine:
+	if args.no_refine or job.get('workflow') in job.get('workflow_prompts', {}):
 		node_id, name = refine_slot(workflow)
 		if node_id is not None:
 			workflow[node_id]['inputs'][name] = False
@@ -369,7 +464,7 @@ def patch_graph(template, job, args):
 			if 'width' in inputs and 'height' in inputs:
 				inputs['width'], inputs['height'] = width, height
 
-	stem = Path(job['target']).stem
+	stem = job.get('item_id') or Path(job['target']).stem
 	one_node(workflow, 'SaveVideo' if video else 'SaveImage')['inputs']['filename_prefix'] = \
 		f'{args.prefix}/{job["situation"]}/{stem}'
 
@@ -433,14 +528,17 @@ def history(server, prompt_id):
 
 
 def output_files(node_output):
-	return [item for key in ('images', 'videos', 'gifs')
+	return [item for key in ('images', 'videos', 'gifs', 'audio')
 		for item in node_output.get(key, ()) if 'filename' in item]
 
 
-def save_outputs(server, entry, target):
+def save_outputs(server, entry, target, audio_only=False):
 	written = []
 	for node_output in (entry.get('outputs') or {}).values():
-		for image in output_files(node_output):
+		files = output_files({'audio': node_output.get('audio', ())} if audio_only else node_output)
+		for image in files:
+			if audio_only and image.get('type', 'output') != 'output':
+				continue
 			query = urllib.parse.urlencode({
 				'filename': image['filename'],
 				'subfolder': image.get('subfolder', ''),
@@ -486,31 +584,61 @@ def display(path):
 
 def existing(target):
 	stem = resolve(target).with_suffix('')
-	return [p for p in (stem.with_suffix(ext) for ext in EXTS) if p.exists()]
+	return [p for p in (stem.parent / (stem.name + ext) for ext in EXTS) if p.exists()]
 
 
-def make_jobs(items, args, workflows):
+def make_jobs(items, args, workflows, auto_default=None):
 	jobs = []
+	audio_targets = set()
 	for workflow in workflows:
 		graph = json.loads(Path(WORKFLOWS[workflow]).read_text(encoding='utf-8'))
-		is_video = bool(nodes_of(graph, 'SaveVideo'))
+		audio = workflow_media(graph) == 'audio'
+		first_job = len(jobs)
 		for item in items:
-			if (item['situation'] == 'video') != is_video:
+			if not compatible(graph, item):
+				continue
+			if auto_default is not None and workflow not in (preferred_workflows(item) or (auto_default,)):
+				continue
+			texts = texts_for(item, workflow)
+			if not texts:
 				continue
 			# A career caption writes one card per quoted paragraph; the deck
 			# reads no career variants, so extra texts are separate files, not
 			# seed repeats. A planet caption is one text repeated by --variants.
-			pictures = (len(item['texts']) if item['situation'] in ('career', 'video')
+			pictures = (len(texts) if item['situation'] in ('career', 'video')
 				else args.variants)
 			for variant in range(pictures):
 				job = dict(item)
-				job['text'] = item['texts'][variant % len(item['texts'])]
+				job['text'] = texts[variant % len(texts)]
 				job['workflow'] = workflow
 				job['variant'] = variant
-				job['target'] = display(target_path(job, args.out))
 				# one deterministic seed per job so a rerun reproduces the same
 				# picture; without --seed the template's own seed is reused
-				job['seed'] = None if args.seed is None else args.seed + len(jobs)
+				offset = len(jobs) - first_job if audio else len(jobs)
+				job['seed'] = None if args.seed is None else args.seed + offset
+				if audio:
+					if job['adapter'] == 'stable-audio':
+						if args.variants > 100:
+							raise SystemExit('Stable Audio cue packs support at most 100 takes per prompt')
+						base = music.stable_bindings(graph)[2]['seed'] if args.seed is None else args.seed
+						job['seed'] = base + job['pack_index'] * 100 + variant
+					patched = patch_graph(graph, job, args)
+					metadata = music.provenance(patched, job)
+					model = music.model_dir(metadata['checkpoint'])
+					folder = Path(args.out) / job['type'] / workflow / model / job['sample_id']
+					if job['adapter'] == 'stable-audio':
+						folder /= music.cue_run_dir(patched, metadata)
+					job['target'] = display(folder / f'take-{variant + 1}{Path(job["target"]).suffix}')
+					if job['target'] in audio_targets:
+						raise SystemExit(f'duplicate audio target: {job["target"]}')
+					audio_targets.add(job['target'])
+				else:
+					target = target_path(job, args.out)
+					if job.get('item_id'):
+						target = Path(args.out) / 'items' / job['item_id'] / workflow / f'take-{variant + 1}{target.suffix}'
+					elif job.get('workflow_prompts'):
+						target = target.with_stem(f'{target.stem}__{workflow}')
+					job['target'] = display(target)
 				jobs.append(job)
 	return jobs
 
@@ -540,7 +668,7 @@ def print_table(items):
 # --------------------------------------------------------------------- main
 
 def collect(server, manifest, timeout, only_targets=None):
-	"""Poll finished jobs in the manifest and download their images."""
+	"""Poll finished jobs in the manifest and download their outputs."""
 	pending = [j for j in manifest['jobs']
 		if not j.get('done') and (only_targets is None or j['target'] in only_targets)]
 	if not pending:
@@ -549,6 +677,7 @@ def collect(server, manifest, timeout, only_targets=None):
 	print(f'collecting {len(pending)} job(s) ...')
 	deadline = time.time() + timeout
 	missing = set(j['prompt_id'] for j in pending)
+	failed = False
 	while missing and time.time() < deadline:
 		for prompt_id in list(missing):
 			try:
@@ -565,10 +694,23 @@ def collect(server, manifest, timeout, only_targets=None):
 			status = (entry.get('status') or {}).get('status_str', '')
 			if status == 'error':
 				print(f'  ! {job["target"]}: {job["workflow"]} run failed server-side')
+				failed = True
 			else:
-				for path in save_outputs(server, entry, job['target']):
+				provenance = job.get('audio', job.get('music'))
+				is_audio = provenance is not None
+				paths = save_outputs(server, entry, job['target'], audio_only=is_audio)
+				if is_audio:
+					if not paths:
+						print(f'  ! {job["target"]}: history contains no saved audio')
+						failed = True
+					job['files'] = [display(path) for path in paths]
+					for path in paths:
+						metadata = dict(provenance, workflow=job['workflow'], prompt_id=prompt_id, file=path.name)
+						path.with_suffix(path.suffix + '.json').write_text(
+							json.dumps(metadata, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+				for path in paths:
 					print(f'  + {display(path)}')
-				job['done'] = True
+				job['done'] = bool(paths) or not is_audio
 			missing.discard(prompt_id)
 			write_manifest(manifest)
 		if missing:
@@ -577,7 +719,7 @@ def collect(server, manifest, timeout, only_targets=None):
 		print(f'{len(missing)} job(s) still queued after {timeout:.0f}s; '
 			f'run --collect again once ComfyUI finishes them')
 		return False
-	return True
+	return not failed
 
 
 def queue(server, jobs, args, client_id):
@@ -602,6 +744,9 @@ def queue(server, jobs, args, client_id):
 		workflow = build(template, job, args)
 		if args.dump:
 			dump = Path(args.dump) / f'{job["workflow"]}_{Path(job["target"]).stem}.json'
+			if job.get('media') == 'audio' or job.get('item_id') or job.get('workflow_prompts'):
+				relative = resolve(job['target']).relative_to(Path(args.out).resolve())
+				dump = Path(args.dump) / relative.with_suffix('.json')
 			dump.parent.mkdir(parents=True, exist_ok=True)
 			dump.write_text(json.dumps(workflow, indent='\t') + '\n', encoding='utf-8')
 		if args.dry_run:
@@ -611,17 +756,18 @@ def queue(server, jobs, args, client_id):
 		prompt_id = queue_job(server, workflow, client_id, job_extra_data(job, args))
 		key = f'{job["workflow"]}:{job["target"]}'
 		manifest['jobs'] = [j for j in manifest['jobs'] if j.get('key') != key]
+		metadata = {'audio': music.provenance(workflow, job)} if job.get('media') == 'audio' else {}
 		manifest['jobs'].append({
+			**metadata,
 			'key': key,
 			'prompt_id': prompt_id, 'target': job['target'], 'type': job['type'],
 			'situation': job['situation'], 'variant': job['variant'],
 			'workflow': job['workflow'], 'seed': job['seed'],
 			'queued': time.strftime('%Y-%m-%d %H:%M:%S'), 'done': False,
 		})
+		write_manifest(manifest)
 		queued += 1
 		print(f'  + queue {display(resolve(job["target"]))} ({job["workflow"]}, {prompt_id[:8]})')
-	if not args.dry_run:
-		write_manifest(manifest)
 	return manifest, queued
 
 
@@ -675,7 +821,7 @@ def main(argv=None):
 	parser.add_argument('--project', default=None,
 		help='project configuration JSON (default: gravity, else the first '
 			'project found in projects/)')
-	parser.add_argument('--prompts', action='append', help='Markdown prompt file (repeatable)')
+	parser.add_argument('--prompts', action='append', help='Markdown caption or JSON audio pack (repeatable)')
 	parser.add_argument('--workflow-dir', help='directory of API workflow JSON templates')
 	parser.add_argument('--prefix', default=None, help='ComfyUI output prefix')
 	parser.add_argument('--server', default=DEFAULT_SERVER,
@@ -711,7 +857,7 @@ def main(argv=None):
 	parser.add_argument('--dry-run', action='store_true', help='print the jobs, queue nothing')
 	parser.add_argument('--dump', default=None, metavar='DIR',
 		help='write each patched workflow to DIR for inspection')
-	parser.add_argument('--wait', action='store_true', help='download the images as they finish')
+	parser.add_argument('--wait', action='store_true', help='download outputs as they finish')
 	parser.add_argument('--timeout', type=float, default=1800,
 		help='seconds to wait for renders with --wait/--collect (default 1800)')
 	parser.add_argument('--collect', action='store_true',
@@ -749,30 +895,47 @@ def main(argv=None):
 	global manifest_path
 	manifest_path = Path(args.manifest) if args.manifest else Path(args.out) / MANIFEST_NAME
 
-	paths = [Path(p).resolve() for p in args.prompts] if args.prompts else [base / p for p in config['prompts']]
-	items = project_items([item for path in paths for item in read_prompts(path)], config)
-	if args.list:
-		print_table(items)
-		return 0
-
 	if args.collect:
 		try:
 			return 0 if collect(args.server, load_manifest(), args.timeout) else 1
 		except ComfyError as err:
 			raise SystemExit(str(err))
 
-	workflows = resolve_workflow(args.workflow if args.workflow is not None
-		else config.get('default_workflow') or default_workflow())
-	for workflow in workflows:
-		for spec in args.set:
-			apply_override(json.loads(Path(WORKFLOWS[workflow]).read_text(encoding='utf-8')), spec)
+	paths = [Path(p).resolve() for p in args.prompts] if args.prompts else [base / p for p in config['prompts']]
+	if not paths:
+		raise SystemExit('no prompt packs configured; pass --prompts PATH')
+	items = project_items([item for path in paths for item in read_prompts(path)], config)
+	validate_item_ids(items)
+	if args.list:
+		print_table(items)
+		return 0
 
-	jobs = make_jobs(select(items, args.types, args.situation), args, workflows)
+	picked = select(items, args.types, args.situation)
+	if args.workflow is not None:
+		jobs = make_jobs(picked, args, resolve_workflow(args.workflow))
+	else:
+		default = config.get('default_workflow') or default_workflow()
+		wanted = dict.fromkeys(name for item in picked for name in (preferred_workflows(item) or (default,)))
+		missing = wanted.keys() - WORKFLOWS.keys()
+		if missing:
+			raise SystemExit(f'preferred workflows not found: {", ".join(sorted(missing))}')
+		jobs = make_jobs(picked, args, wanted, auto_default=default)
+
+	for workflow in dict.fromkeys(job['workflow'] for job in jobs):
+		if args.set:
+			graph = json.loads(Path(WORKFLOWS[workflow]).read_text(encoding='utf-8'))
+			for spec in args.set:
+				apply_override(graph, spec)
+
 	if not jobs:
-		raise SystemExit('no compatible jobs: select an image workflow for images, or a video workflow for video captions')
-	print(f'{len(jobs)} job(s): {", ".join(workflows)} · {args.aspect} · '
-		f'{args.megapixels} MP{"" if args.size is None else f" · {args.size[0]}x{args.size[1]}"}'
-		f'{" · dry run" if args.dry_run else ""}')
+		raise SystemExit('no compatible jobs: match the workflow media to the selected image, video, or music prompts')
+	used = ', '.join(dict.fromkeys(job['workflow'] for job in jobs))
+	dimensions = ''
+	if any(job.get('media') != 'audio' for job in jobs):
+		dimensions = f' · {args.aspect} · {args.megapixels} MP'
+		if args.size is not None:
+			dimensions += f' · {args.size[0]}x{args.size[1]}'
+	print(f'{len(jobs)} job(s): {used}{dimensions}{" · dry run" if args.dry_run else ""}')
 	try:
 		manifest, queued = queue(args.server, jobs, args, uuid.uuid4().hex)
 	except ComfyError as err:

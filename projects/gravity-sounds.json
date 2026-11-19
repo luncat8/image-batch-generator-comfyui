@@ -1,0 +1,8 @@
+{
+	"name": "gravity-sounds",
+	"prompts": [],
+	"workflows": "../workflows",
+	"output": "../output/gravity-sounds",
+	"prefix": "gravity-sounds",
+	"default_workflow": "audio_stable_audio_3_medium_api"
+}

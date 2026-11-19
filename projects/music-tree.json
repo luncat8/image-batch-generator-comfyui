@@ -1,0 +1,8 @@
+{
+	"name": "music-tree",
+	"prompts": [],
+	"workflows": "../workflows",
+	"output": "../output/music-tree",
+	"prefix": "music-tree",
+	"default_workflow": "audio_yue2_text2music_api"
+}

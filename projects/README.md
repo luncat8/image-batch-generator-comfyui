@@ -57,3 +57,64 @@ The renders land in `output/<game>/` (git-ignored here). Copy the chosen
 files into the game repo's image folder — e.g.
 `gravity-trajectory/photos/space/` — or point the project's `output`
 directly at the game repo if you prefer a live link.
+
+## One item, different prompts for different models
+
+Use `*ID:*` to make an item independent of its heading, filename, and prompt
+text. Use lowercase IDs with hyphens or underscores, unique across the project.
+Keep the ID when moving or editing an item; give genuinely different assets
+new IDs. Legacy packs without IDs work as before.
+
+```markdown
+### 1 · art · Moon outpost → `art/moon-outpost.jpg`
+*ID: moon-outpost*
+> A moon outpost at dawn.
+
+*For: image_sd15_booru*
+> moon, lunar outpost, dawn, wide shot, rim lighting
+
+*For: image_moss_image_t2i*
+> A low camera looks across the crater as the first light catches the outpost windows.
+
+*For: image_custom_json*
+> {
+>   "subject": "lunar outpost",
+>   "lighting": "dawn"
+> }
+```
+
+- The workflow names are **installed API JSON filename stems**, not checkpoint
+  filenames. The SD1.5 and JSON stems above are illustrative; install suitable
+  workflows or replace the stems with names in your project. Image workflows
+  still need the `##prompt` input marker.
+- Each `*For:*` starts one prompt block and marks its workflow as preferred for
+  that item. List several stems separated by commas to share one block. Line
+  breaks and indentation inside the block are preserved; JSON is passed as
+  prompt text, not interpreted as workflow settings. The batch CLI skips a
+  graph's optional prompt refiner for these model-specific blocks.
+- An optional untagged quote must come **before** the first `*For:*`. It is a
+  fallback for another workflow you explicitly enable or request. With no
+  fallback, other workflows skip the item. Without any `*For:*`, the project
+  default applies. A gallery card with an ID or `*For:*` stays one card; use
+  separate IDs for separate assets rather than using blank quotes as assets.
+- The gallery and its **Run batch** button use these preferences automatically.
+  Workflow checkboxes override the automatic selection; **Reset to prompt
+  defaults** restores it. The standalone CLI uses preferences unless you pass
+  `--workflow` explicitly. Its ID-based renders are saved under
+  `items/<id>/<workflow>/take-N.<ext>`, so model outputs do not overwrite one
+  another. Untagged legacy filename rules are unchanged.
+
+## Adding files and previewing audio in the gallery
+
+Use **Prompt files → Add prompt files…** to attach Markdown or an audio JSON
+pack to the current project. The gallery saves a link in the project JSON; it
+neither copies nor rewrites the prompt pack. After editing a pack in your
+editor, click **Refresh** to reload it. If the project JSON cannot be written,
+attach the file to a writable project instead.
+
+Audio prompt packs for YuE2 and Stable Audio appear as cards and can be queued
+like visual prompts. Collected takes show their checkpoint and seed whenever
+sidecar metadata is present. Click **Preview audio** to play a take in a
+Play/Stop window if `ffplay` is installed; otherwise the gallery opens it in
+the system's associated media player. Audio collected by the CLI appears when
+the gallery uses the same output folder and contains the matching prompt pack.
