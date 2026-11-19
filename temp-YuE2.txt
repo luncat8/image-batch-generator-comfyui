@@ -1,0 +1,101 @@
+# YuE2: Text to Music
+
+YuE2 is a music generation model that creates complete songs with vocals and instrumental accompaniment from a **music style** and **lyrics**.
+
+With ABC Planning enabled, YuE2 first creates an editable symbolic music plan (melody and optionally chords), then generates the final audio from that plan.
+
+## Model Link
+
+- [Hugging Face:Comfy-Org/YuE2](https://huggingface.co/Comfy-Org/YuE2)
+
+**ModelScope mirrors** (alternative repo location)
+
+- [ModelScope:Comfy-Org/YuE2](https://modelscope.cn/models/Comfy-Org/YuE2)
+
+**checkpoints**
+
+- [yue2_3b_int8_convrot.safetensors](https://huggingface.co/Comfy-Org/YuE2/resolve/main/checkpoints/yue2_3b_int8_convrot.safetensors) (3.69 GB)
+
+## Model Storage Location
+
+```
+📂 ComfyUI/
+├── 📂 models/
+│   └── 📂 checkpoints/
+│       └── yue2_3b_int8_convrot.safetensors
+```
+
+## How to Use
+
+1. Write a description of the music you want in **Style**.
+2. Enter your song lyrics in **Lyrics** using section tags such as `[Verse]` and `[Chorus]`.
+3. Choose a planning **Mode**.
+4. Set the **Max Duration**.
+5. Run the workflow to generate the song.
+
+## Writing the Style
+
+Describe the main musical characteristics, such as:
+
+- **Genre:** pop, jazz, rock, electronic, folk
+- **Vocals:** warm female vocal, expressive male vocal, soft vocals
+- **Language:** English, Chinese, Japanese, etc.
+- **Tempo:** 90 BPM, slow, upbeat
+- **Instruments:** piano, electric guitar, bass, drums, synths
+
+Example:
+
+> English, warm female vocal, contemporary pop, 96 BPM, piano, rounded electric bass, restrained drums, clear diction
+
+Keep musical instructions in **Style** rather than in the lyrics.
+
+## Writing Lyrics
+
+Use section tags to describe the song structure:
+
+    [Verse]
+    Morning light across the window
+    City waking down below
+
+    [Chorus]
+    Run with me into the sunlight
+    Leave the shadows far behind
+
+You can structure the song with sections such as:
+
+`[Verse]` · `[Chorus]` · `[Bridge]` · `[Outro]`
+
+Put only the words intended to be sung in the lyrics field.
+
+## ABC Planning
+
+**Full**
+Creates a symbolic plan with **melody and chords** before generating the song. Recommended for general text-to-music generation.
+
+**Melody**
+Creates a **melody-only** plan and allows the accompaniment to be generated more freely.
+
+Disable **ABC Planning** to generate music directly from Style and Lyrics without creating a symbolic plan.
+
+## Max Duration
+
+Sets the **maximum** duration of the generated song in seconds.
+
+The song may finish earlier depending on the generated musical structure and lyrics.
+
+## Prompt Guide
+
+For better results, describe the musical intent clearly and keep Style and Lyrics separate:
+
+**Style**
+`Language + Genre + Vocal Character + Tempo + Instruments + Musical Characteristics`
+
+**Lyrics**
+Use section tags and provide only the words that should be sung.
+
+## Learn More
+
+- [YuE2 Generation Guide](https://github.com/multimodal-art-projection/YuE/blob/main/docs/generation.md)
+- [YuE2 Music Skill](https://github.com/multimodal-art-projection/YuE/blob/main/skills/yue2-music/SKILL.md)
+- [Generation & Covers Reference](https://github.com/multimodal-art-projection/YuE/blob/main/skills/yue2-music/references/generation-and-covers.md)
+
