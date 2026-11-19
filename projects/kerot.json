@@ -1,0 +1,15 @@
+{
+	"name": "kerot",
+	"prompts": ["kerot/prompts.md"],
+	"workflows": "../workflows",
+	"output": "../output/kerot",
+	"gallery_output": "../output/kerot",
+	"prefix": "kerot",
+	"default_workflow": "image_moss_image_t2i",
+	"category_sizes": {
+		"drawer": ["2:3", 1.5],
+		"board": ["16:9", 1.5],
+		"win": ["16:9", 1.5],
+		"legacy": ["16:9", 1.5]
+	}
+}

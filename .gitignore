@@ -1,0 +1,7 @@
+# generated output: candidates, state.toml, manifests per game
+/output/
+/projects.json
+
+# python
+__pycache__/
+*.pyc
