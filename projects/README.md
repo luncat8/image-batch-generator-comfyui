@@ -113,8 +113,14 @@ editor, click **Refresh** to reload it. If the project JSON cannot be written,
 attach the file to a writable project instead.
 
 Audio prompt packs for YuE2 and Stable Audio appear as cards and can be queued
-like visual prompts. Collected takes show their checkpoint and seed whenever
-sidecar metadata is present. Click **Preview audio** to play a take in a
-Play/Stop window if `ffplay` is installed; otherwise the gallery opens it in
-the system's associated media player. Audio collected by the CLI appears when
-the gallery uses the same output folder and contains the matching prompt pack.
+like visual prompts. Gravity cue packs default to Stable Audio; to try the
+same prompts in YuE2, uncheck Stable Audio and check YuE2. The cue text goes
+into **Style**, **Lyrics** is left blank, and YuE2 uses its own duration and
+sampler defaults instead of the cue's `seconds` and `steps`.
+
+Click **Play** on a take to preview it in place, and click the same button
+(**Stop**) to end playback. Playing a different take stops the previous one.
+Install FFmpeg with `ffplay` on `PATH` to enable preview; the gallery does not
+open an external player. Collected takes show their checkpoint and seed when
+sidecar metadata is present. Audio collected by the CLI appears when the
+gallery uses the same output folder and contains the matching prompt pack.

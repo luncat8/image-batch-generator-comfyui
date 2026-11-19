@@ -2,6 +2,7 @@
 """Offline generator regressions: python -m unittest discover -s . -p 'test_*.py'."""
 import contextlib
 import io
+import importlib.util
 import json
 import sys
 import tempfile
@@ -10,6 +11,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 sys.dont_write_bytecode = True
 
@@ -281,7 +283,7 @@ class GeneratorTests(unittest.TestCase):
 				armed=[], launch=[dict(id='impact', text='Impact', seconds=4.5, steps=10)], fly=[])))
 			items = core.read_prompts(pack)
 			args = settings(out=directory, variants=2, seed=None)
-			jobs = core.make_jobs(items, args, list(core.WORKFLOWS))
+			jobs = core.make_jobs(items, args, list(core.WORKFLOWS), auto_default=STABLE_WF.stem)
 			self.assertEqual([job['workflow'] for job in jobs], [STABLE_WF.stem] * 4)
 			self.assertEqual([job['seed'] for job in jobs], [4100, 4101, 4200, 4201])
 			selected = core.select(items, 'launch', 'both')
@@ -297,6 +299,67 @@ class GeneratorTests(unittest.TestCase):
 			new, = core.make_jobs(selected, changed, [STABLE_WF.stem])
 			self.assertNotEqual(job['target'], new['target'])
 			self.assertEqual(core.music.provenance(graph, job)['cue'], 'launch')
+
+	def test_gallery_routes_gravity_cue_with_yue2_checked(self):
+		with tempfile.TemporaryDirectory() as directory:
+			pack = Path(directory) / 'cues.json'
+			pack.write_text(json.dumps(dict(aim=[], armed=[], fly=[dict(
+				id='loop', text='Bright synth arpeggio', seconds=5, steps=8)], launch=[])))
+			card, = launch.parse_prompts(pack)
+			self.assertTrue(launch.enabled_for(card, STABLE_WF, {}))
+			self.assertFalse(launch.enabled_for(card, AUDIO_WF, {}))
+			state = {'workflows': {STABLE_WF.name: False, AUDIO_WF.name: True}}
+			self.assertEqual([p for p in (STABLE_WF, AUDIO_WF) if launch.enabled_for(card, p, state)], [AUDIO_WF])
+			yue = json.loads(AUDIO_WF.read_text())
+			self.assertTrue(launch.compatible(yue, card))
+			graph = launch.patch_workflow(yue, card, 123, settings(no_slg=True), AUDIO_WF.stem)
+			style, lyrics, seed, _ = core.music.bindings(graph)
+			self.assertEqual((style['value'], lyrics['value'], seed['seed']), ('Bright synth arpeggio', '', 123))
+			self.assertEqual(graph['33:8']['inputs']['steps'], yue['33:8']['inputs']['steps'])
+			self.assertEqual(graph['33:25']['inputs']['max_duration'], yue['33:25']['inputs']['max_duration'])
+			self.assertEqual(yue['33:36']['inputs']['value'], '##prompt')
+			meta = core.music.provenance(graph, dict(card, variant=0))
+			self.assertEqual((meta['cue'], meta['sample_id']), ('fly', 'loop'))
+			self.assertEqual(meta['checkpoint'], 'yue2_3b_int8_convrot.safetensors')
+
+	@unittest.skipUnless(importlib.util.find_spec('tkinter'), 'Tkinter is not installed')
+	def test_inline_audio_preview_switches_and_resets_on_exit(self):
+		from gallery import App
+
+		a, b = Path('first take.opus'), Path('second take.flac')
+		a_button, b_button = Mock(), Mock()
+		app = SimpleNamespace(_audio_path=None, _audio_process=None,
+			_audio_buttons={a: {a_button}, b: {b_button}}, status=Mock())
+		for method in (App._paint_audio_buttons, App.stop_audio):
+			setattr(app, method.__name__, method.__get__(app))
+		first, second = Mock(), Mock()
+		first.poll.side_effect = lambda: 0 if first.kill.called else None
+		second.poll.return_value = None
+		with patch('gallery.shutil.which', return_value='/ffplay'), \
+				patch('gallery.subprocess.Popen', side_effect=[first, second]) as play:
+			App.preview_audio(app, a)
+			self.assertIn('-nodisp', play.call_args.args[0])
+			self.assertEqual(play.call_args.args[0][-1], str(a))
+			self.assertEqual(a_button.configure.call_args.kwargs['text'], '■ Stop')
+			self.assertIn('bg', a_button.configure.call_args.kwargs)
+			App.preview_audio(app, b)
+			first.kill.assert_called_once()
+			first.wait.assert_called_once_with(timeout=0.5)
+			self.assertEqual(a_button.configure.call_args.kwargs['text'], '▶ Play')
+			self.assertEqual(b_button.configure.call_args.kwargs['text'], '■ Stop')
+			App.preview_audio(app, b)
+			second.kill.assert_called_once()
+			self.assertEqual(b_button.configure.call_args.kwargs['text'], '▶ Play')
+			self.assertEqual(play.call_count, 2)
+
+		app._audio_path, app._audio_process = a, first
+		App._poll_audio(app)
+		self.assertIsNone(app._audio_process)
+		a_button.configure.assert_called_with(text='▶ Play')
+		with patch('gallery.shutil.which', return_value=None), patch('gallery.subprocess.Popen') as play:
+			App.preview_audio(app, a)
+			play.assert_not_called()
+			self.assertIn('ffplay', app.status.call_args.args[0])
 
 	def test_queue_collect_image_video_and_audio(self):
 		requests = []
@@ -373,6 +436,16 @@ class GeneratorTests(unittest.TestCase):
 				self.assertIn('steps: 10', audition)
 				take, = out.rglob('take-1.flac')
 				self.assertIn(take.relative_to(out).as_posix(), audition)
+
+				with contextlib.redirect_stdout(io.StringIO()):
+					self.assertEqual(core.main(['--project', str(HERE / 'projects/gravity-sounds.json'),
+						'--out', str(out), '--server', f'http://127.0.0.1:{server.server_port}',
+						'--prompts', str(cues), '--workflow', AUDIO_WF.stem, '--wait']), 0)
+				take, = out.glob(f'launch/{AUDIO_WF.stem}/**/take-1.flac')
+				meta = json.loads(take.with_suffix('.flac.json').read_text())
+				self.assertEqual((meta['cue'], meta['sample_id'], meta['style']), ('launch', 'fixture', 'Impact <test>'))
+				self.assertEqual(meta['workflow'], AUDIO_WF.stem)
+				self.assertEqual(meta['lyrics'], '')
 
 		finally:
 			server.shutdown()

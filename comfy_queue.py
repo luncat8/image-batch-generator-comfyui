@@ -392,17 +392,19 @@ def workflow_media(graph):
 
 def compatible(graph, item):
 	media = item.get('media', 'video' if item['situation'] == 'video' else 'image')
-	return workflow_media(graph) == media and (media != 'audio' or music.adapter(graph) == item['adapter'])
+	return workflow_media(graph) == media and (media != 'audio' or music.supports(graph, item))
 
 
 def patch_audio(workflow, job, args):
 	if any(getattr(args, key) is not None for key in ('size', 'negative')):
 		raise SystemExit('audio does not support --size or --negative')
-	if job['adapter'] == 'stable-audio':
+	if not music.supports(workflow, job):
+		raise SystemExit('audio prompt is not compatible with this workflow')
+	if music.adapter(workflow) == 'stable-audio':
 		music.patch_stable(workflow, job, args)
 	else:
 		style, lyrics, seed, _ = music.bindings(workflow)
-		style['value'], lyrics['value'] = job['text'], job['lyrics']
+		style['value'], lyrics['value'] = job['text'], job.get('lyrics', '')
 		if job['seed'] is not None:
 			seed['seed'] = job['seed']
 		for key in ('steps', 'cfg'):
@@ -593,6 +595,7 @@ def make_jobs(items, args, workflows, auto_default=None):
 	for workflow in workflows:
 		graph = json.loads(Path(WORKFLOWS[workflow]).read_text(encoding='utf-8'))
 		audio = workflow_media(graph) == 'audio'
+		stable = audio and music.adapter(graph) == 'stable-audio'
 		first_job = len(jobs)
 		for item in items:
 			if not compatible(graph, item):
@@ -617,7 +620,7 @@ def make_jobs(items, args, workflows, auto_default=None):
 				offset = len(jobs) - first_job if audio else len(jobs)
 				job['seed'] = None if args.seed is None else args.seed + offset
 				if audio:
-					if job['adapter'] == 'stable-audio':
+					if stable:
 						if args.variants > 100:
 							raise SystemExit('Stable Audio cue packs support at most 100 takes per prompt')
 						base = music.stable_bindings(graph)[2]['seed'] if args.seed is None else args.seed
@@ -626,9 +629,9 @@ def make_jobs(items, args, workflows, auto_default=None):
 					metadata = music.provenance(patched, job)
 					model = music.model_dir(metadata['checkpoint'])
 					folder = Path(args.out) / job['type'] / workflow / model / job['sample_id']
-					if job['adapter'] == 'stable-audio':
+					if stable:
 						folder /= music.cue_run_dir(patched, metadata)
-					job['target'] = display(folder / f'take-{variant + 1}{Path(job["target"]).suffix}')
+					job['target'] = display(folder / f'take-{variant + 1}{".flac" if stable else ".opus"}')
 					if job['target'] in audio_targets:
 						raise SystemExit(f'duplicate audio target: {job["target"]}')
 					audio_targets.add(job['target'])

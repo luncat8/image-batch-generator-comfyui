@@ -347,11 +347,10 @@ class PromptCard(tk.Frame):
 		app, bg = self.app, self.bg
 		cell = tk.Frame(self.thumb_box, bg=bg)
 		if path.suffix.lower() in AUDIO_EXTS:
-			lbl = app.mkbtn(cell, "▶ Preview audio", lambda: app.open_viewer(self.key, path))
+			lbl = app.audio_button(cell, path)
 			lbl.grid(sticky="w")
 			tk.Label(cell, text=app.audio_label(path), bg=bg, fg=DIM, wraplength=THUMB_W,
 				font=app.F(8)).grid(sticky="w")
-			Tooltip(lbl, str(path))
 			return cell, lbl
 		photo = app.thumb_photo(path)
 		if photo is None:
@@ -845,6 +844,8 @@ class App(tk.Tk):
 		self.trash_stack = []
 		self.batch_proc = None
 		self.batch_win = None
+		self._audio_path = self._audio_process = None
+		self._audio_buttons = {}
 		self.view_w = 0          # list viewport width, from the canvas Configure
 		self._stop = False
 		self._thumb_cache = {}
@@ -1200,7 +1201,10 @@ class App(tk.Tk):
 	def _on_escape(self, event):
 		if self._typing(event):
 			return None
-		self._clear_filter()
+		if self._audio_process is not None:
+			self.stop_audio()
+		else:
+			self._clear_filter()
 		return "break"
 
 	def focus_filter(self):
@@ -1327,10 +1331,11 @@ class App(tk.Tk):
 				key = self.item_owner.get(rel.parts[1])
 			if key is None and Path(name).suffix.lower() in AUDIO_EXTS:
 				meta = self.audio_metadata(self.out_dir / name)
-				kind, group = ("yue2", meta.get("genre_id")) if "genre_id" in meta else ("stable-audio", meta.get("cue"))
+				# Sidecar group identifies the source pack, not the rendering model.
+				source_adapter, group = ("stable-audio", meta.get("cue")) if "cue" in meta else ("yue2", meta.get("genre_id"))
 				sample = meta.get("sample_id")
 				if isinstance(group, str) and isinstance(sample, str):
-					key = self.audio_owner.get((kind, group, sample))
+					key = self.audio_owner.get((source_adapter, group, sample))
 			if key is None:
 				orphans += 1
 				continue
@@ -1429,6 +1434,8 @@ class App(tk.Tk):
 		path = Path(path)
 		if not path.exists():
 			return
+		if path == self._audio_path:
+			self.stop_audio()
 		trash = self.trash_dir
 		try:
 			trash.mkdir(parents=True, exist_ok=True)
@@ -1489,7 +1496,7 @@ class App(tk.Tk):
 			no_slg=not bool(self.cfg("slg")),
 		)
 
-	def enqueue_variations(self, key, count=None, seed=None, quiet=False):
+	def enqueue_variations(self, key, count=None, seed=None, issues=None):
 		job = self.jobs.get(key)
 		if job is None:
 			return 0
@@ -1499,10 +1506,11 @@ class App(tk.Tk):
 			return 0
 		wfs = [p for p in self.wf_paths if launch.enabled_for(job, p, self.st)]
 		if not wfs:
-			if not quiet:
-				messagebox.showwarning(
-					"no workflow", "No workflow is enabled.\n"
-					"Check this item’s workflow names or enable a workflow with a fallback prompt.")
+			message = "No workflow is enabled for this prompt. Check the Workflows sidebar."
+			if issues is None:
+				messagebox.showwarning("No workflow", message, parent=self)
+			else:
+				issues.append(message)
 			return 0
 		if count is None:
 			try:
@@ -1534,12 +1542,14 @@ class App(tk.Tk):
 						f"{job['slug']}" + (f" (seed {seed})" if seed else ""))
 			self.sync_cards()
 			self.update_pending_label()
-		elif first_err and not quiet:
-			messagebox.showerror("queue failed", first_err)
-		elif not first_err and not quiet:
-			messagebox.showwarning("No matching workflow", "No enabled workflow accepts this item’s prompt and media type.", parent=self)
-		elif first_err:
-			self.status(f"queue failed - {' '.join(first_err.split())[:160]}")
+		else:
+			message = first_err or "No enabled workflow accepts this prompt and media type."
+			if issues is not None:
+				issues.append(message)
+			elif first_err:
+				messagebox.showerror("Queue failed", message, parent=self)
+			else:
+				messagebox.showwarning("No matching workflow", message, parent=self)
 		return queued
 
 	def enqueue_all(self):
@@ -1548,10 +1558,13 @@ class App(tk.Tk):
 		if not keys:
 			self.status("no enabled prompts to queue")
 			return
-		total = 0
-		for k in keys:
-			total += self.enqueue_variations(k, quiet=True) or 0
-		self.status(f"queued {total} variation job(s) across {len(keys)} enabled prompt(s)")
+		issues = []
+		total = sum(self.enqueue_variations(k, issues=issues) for k in keys)
+		if not total and issues:
+			self.status(f"Nothing queued: {issues[0]}")
+		else:
+			note = f" · {len(issues)} prompt(s) skipped: {issues[0]}" if issues else ""
+			self.status(f"queued {total} variation job(s) across {len(keys) - len(issues)} prompt(s){note}")
 
 	def copy_caption(self, key):
 		job = self.jobs.get(key)
@@ -1640,6 +1653,7 @@ class App(tk.Tk):
 			self.project_var.set(str(self.project_path))
 			return
 		self._close_viewer()
+		self.stop_audio()
 		self.pending.clear()           # those jobs belong to the other project
 		self.pending_fails.clear()
 		self.trash_stack.clear()
@@ -1725,41 +1739,88 @@ class App(tk.Tk):
 		except OSError as error:
 			messagebox.showerror("Cannot open media", str(error), parent=self)
 
+	def audio_button(self, parent, path):
+		label = "■ Stop" if path == self._audio_path else "▶ Play"
+		button = self.mkbtn(parent, label, lambda: self.preview_audio(path), width=9)
+		buttons = self._audio_buttons.setdefault(path, set())
+		buttons.add(button)
+
+		def forget(_event):
+			buttons.discard(button)
+			if not buttons:
+				self._audio_buttons.pop(path, None)
+
+		button.bind("<Destroy>", forget, add="+")
+		Tooltip(button, str(path))
+		return button
+
+	def _paint_audio_buttons(self, path):
+		"""Paint every visible control for this file without changing its size."""
+		playing = path == self._audio_path
+		for button in tuple(self._audio_buttons.get(path, ())):
+			try:
+				button.configure(text="■ Stop" if playing else "▶ Play",
+					bg=ACCENT if playing else BTN,
+					fg=ACCENT_TXT if playing else FG,
+					activebackground=ACCENT if playing else BTN_ACTIVE,
+					activeforeground=ACCENT_TXT if playing else FG)
+			except tk.TclError:  # the card may have been rebuilt during playback
+				self._audio_buttons.get(path, set()).discard(button)
+
+	def stop_audio(self):
+		"""Stop and reap the current player before another file is started.
+
+		Keeping at most one live ffplay process is important on audio devices
+		that mix streams even after a button switches to a different take.
+		"""
+		process, path = self._audio_process, self._audio_path
+		# Clear ownership first so repeated clicks and the poll tick cannot stop
+		# or repaint a newer preview.
+		self._audio_process = self._audio_path = None
+		if path is not None:
+			self._paint_audio_buttons(path)
+		if process is None:
+			return
+		try:
+			if process.poll() is None:
+				process.kill()
+			try:
+				process.wait(timeout=0.5)
+			except subprocess.TimeoutExpired:
+				# A slow OS reap must not freeze the gallery; the killed process is
+				# no longer producing audio while its handle is reaped in background.
+				threading.Thread(target=process.wait, daemon=True).start()
+		except (OSError, ProcessLookupError):
+			pass
+
 	def preview_audio(self, path):
+		path = Path(path)
+		if path == self._audio_path:
+			self.stop_audio()
+			return
 		player = shutil.which("ffplay")
 		if not player:
-			self.open_media_file(path)
+			self.status("Audio preview needs ffplay. Install FFmpeg with ffplay on PATH.")
 			return
-		self._close_viewer()
-		win = self._viewer = tk.Toplevel(self)
-		win.title("Audio preview")
-		win.transient(self)
-		tk.Label(win, text=self.audio_label(path), padx=16, pady=8).pack()
-		tk.Label(win, text=path.name, padx=16).pack()
-		process = None
+		self.stop_audio()
+		try:
+			process = subprocess.Popen(
+				[player, "-nodisp", "-autoexit", "-loglevel", "error", "-i", str(path)],
+				stdin=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+		except OSError as error:
+			self.status(f"Cannot start audio preview: {error}")
+			return
+		self._audio_process, self._audio_path = process, path
+		self._paint_audio_buttons(path)
 
-		def stop():
-			if process is not None and process.poll() is None:
-				try:
-					process.terminate()
-				except ProcessLookupError:
-					pass
-
-		def play():
-			nonlocal process
-			stop()
-			try:
-				process = subprocess.Popen([player, "-nodisp", "-autoexit", "-loglevel", "error", str(path)],
-					stdin=subprocess.DEVNULL)
-			except OSError:
-				self.open_media_file(path)
-
-		win.bind("<Destroy>", lambda event: stop() if event.widget is win else None)
-		bar = tk.Frame(win, pady=8)
-		bar.pack()
-		for label, action in (("Play", play), ("Stop", stop), ("Open in player", lambda: self.open_media_file(path))):
-			self.mkbtn(bar, label, action).pack(side="left", padx=4)
-		play()
+	def _poll_audio(self):
+		process = self._audio_process
+		if process is not None:
+			code = process.poll()
+			if code is not None and process is self._audio_process:
+				self.stop_audio()
+				if code:
+					self.status(f"Audio preview failed (ffplay exited with code {code})")
 
 	def open_viewer(self, key, path):
 		if Path(path).suffix.lower() in AUDIO_EXTS:
@@ -1771,9 +1832,6 @@ class App(tk.Tk):
 			return
 		self.select_key(key)
 		viewer = getattr(self, "_viewer", None)
-		if viewer is not None and viewer.winfo_exists() and not isinstance(viewer, Viewer):
-			self._close_viewer()
-			viewer = None
 		if viewer is not None and viewer.winfo_exists():
 			viewer.key = key
 			viewer.path = Path(path)
@@ -1911,20 +1969,26 @@ class App(tk.Tk):
 															padx=14, pady=14)
 
 	def _fill_grid_cell(self, cell, key, path):
-		photo = self.thumb_photo(path)
-		if photo is None:
-			lbl = tk.Label(cell, text="▶ Preview audio" if path.suffix.lower() in AUDIO_EXTS else "?  (no preview)", bg=EDGE, fg=DIM,
-						   width=22, height=6, font=self.F(8))
+		if path.suffix.lower() in AUDIO_EXTS:
+			# Reuse the fixed preview slot; swapping Play/Stop never resizes it.
+			slot = tk.Label(cell, bg=EDGE, width=22, height=6, font=self.F(8))
+			slot.pack()
+			self.audio_button(slot, path).place(relx=.5, rely=.5, anchor="center")
 		else:
-			lbl = tk.Label(cell, image=photo, bg=CARD, cursor="hand2")
-			self._grid_photo[str(path)] = photo  # keep the master alive
-		lbl.pack()
+			photo = self.thumb_photo(path)
+			if photo is None:
+				lbl = tk.Label(cell, text="?  (no preview)", bg=EDGE, fg=DIM,
+					width=22, height=6, font=self.F(8))
+			else:
+				lbl = tk.Label(cell, image=photo, bg=CARD, cursor="hand2")
+				self._grid_photo[str(path)] = photo  # keep the master alive
+			lbl.pack()
+			lbl.bind("<Button-1>", lambda e: self.open_viewer(key, path))
 		slug = self.jobs[key]["slug"].split("__", 2)[-1]
 		tk.Label(cell, text=slug, bg=CARD, fg=FG, font=self.F(8)).pack(anchor="w")
 		tk.Label(cell, text=f"{self.jobs[key]['category']} · {path.name}",
 				 bg=CARD, fg=FAINT, font=self.F(7), wraplength=THUMB_W,
 				 justify="left").pack(anchor="w")
-		lbl.bind("<Button-1>", lambda e, k=key, p=path: self.open_viewer(k, p))
 
 	def _paint_grid(self):
 		"""A grid cell whose file is gone is dropped; nothing else repaints."""
@@ -2103,6 +2167,7 @@ class App(tk.Tk):
 
 	# ================================================================= drain
 	def _drain(self):
+		self._poll_audio()
 		try:
 			while True:
 				self._handle_event(self.ev.get_nowait())
@@ -2162,6 +2227,7 @@ class App(tk.Tk):
 
 	def _on_close(self):
 		self._stop = True
+		self.stop_audio()
 		try:
 			self.st["app"]["variations"] = int(self.spin_var.get())
 		except Exception:

@@ -360,7 +360,7 @@ def main():
 	core.WORKFLOWS = core.discover_workflows(BASE / CONFIG['workflows'])
 	parsed = {path: parse_prompts(path) for path in find_prompt_mds()}
 	core.validate_item_ids(job for jobs in parsed.values() for job in jobs)
-	queued = 0
+	queued = matched = 0
 	for workflow in find_workflows():
 		template = json.loads(workflow.read_text(encoding='utf-8'))
 		nid, name = slg_slot(template)
@@ -390,8 +390,13 @@ def main():
 		if options.list:
 			core.print_table(jobs)
 			continue
+		if not jobs:
+			continue
+		matched += len(jobs)
 		_, count = core.queue(server, jobs, args, str(uuid.uuid4()))
 		queued += count
+	if not matched and not options.list:
+		print("Nothing queued: no enabled prompts match the selected workflows. Check the gallery checkboxes.")
 	if queued and not options.no_wait and not options.dry_run:
 		if not core.collect(server, core.load_manifest(), 1800):
 			return 1

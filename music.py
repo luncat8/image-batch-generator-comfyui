@@ -81,6 +81,14 @@ def adapter(graph):
 	return None
 
 
+def supports(graph, item):
+	model = adapter(graph)
+	# Gravity's text-only cues can double as YuE2 style prompts. The reverse
+	# direction would discard lyrics and has no Stable Audio duration/steps.
+	return model is not None and (model == item['adapter'] or
+		(model == 'yue2' and item['adapter'] == 'stable-audio'))
+
+
 def stable_bindings(graph):
 	samplers = [n['inputs'] for n in graph.values() if n.get('class_type') == 'KSampler']
 	if len(samplers) != 1:
@@ -135,14 +143,16 @@ def bindings(graph):
 
 
 def provenance(graph, job):
-	if job['adapter'] == 'stable-audio':
+	if adapter(graph) == 'stable-audio':
 		positive, latent, sampler, loader, encoder = stable_bindings(graph)
 		return dict(cue=job['cue'], sample_id=job['sample_id'], take=job['variant'] + 1,
 			checkpoint=loader['ckpt_name'], encoder=encoder['clip_name'], text=positive['text'],
 			seconds=latent['seconds'], **{key: sampler[key] for key in
 				('seed', 'steps', 'cfg', 'sampler_name', 'scheduler')})
 	style, lyrics, seed, loader = bindings(graph)
-	return dict(genre_id=job['genre_id'], sample_id=job['sample_id'], take=job['variant'] + 1,
+	# Keep the source pack identity so either model's take maps to the same card.
+	group = {'cue': job['cue']} if 'cue' in job else {'genre_id': job['genre_id']}
+	return dict(group, sample_id=job['sample_id'], take=job['variant'] + 1,
 		checkpoint=loader['ckpt_name'], seed=seed['seed'],
 		style=style['value'], lyrics=lyrics['value'])
 
